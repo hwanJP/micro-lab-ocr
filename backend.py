@@ -16,12 +16,23 @@ import logging
 import math
 from typing import List, Dict, Tuple, Optional
 
+
+
 # 로깅 설정
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# 🆕 DRM 처리 추가
+try:
+    from drm_utils import process_pdf_with_drm
+    DRM_AVAILABLE = True
+    logger.info("✅ DRM 처리 모듈 로드 완료")
+except ImportError:
+    DRM_AVAILABLE = False
+    logger.warning("⚠️ drm_utils.py 없음 - DRM 처리 비활성화")
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -33,6 +44,49 @@ STRAINS = ['E.coli', 'P.aeruginosa', 'S.aureus', 'C.albicans', 'A.brasiliensis']
 
 class PDFProcessor:
     """PDF 처리 클래스"""
+    
+    # 🆕 DRM 처리 추가
+    @staticmethod
+    def process_drm_if_needed(pdf_bytes: bytes) -> Tuple[bool, bytes, str]:
+        """
+        DRM 자동 판별 및 해제
+        
+        Args:
+            pdf_bytes: PDF 바이트 데이터
+            
+        Returns:
+            Tuple[bool, bytes, str]: (성공여부, 처리된PDF바이트, 메시지)
+        """
+        if not DRM_AVAILABLE:
+            logger.warning("DRM 모듈 없음 - 원본 사용")
+            return True, pdf_bytes, "DRM 모듈 없음 (원본 사용)"
+        
+        try:
+            # BytesIO로 변환
+            pdf_io = io.BytesIO(pdf_bytes)
+            
+            # DRM 처리
+            success, result = process_pdf_with_drm(pdf_io)
+            
+            if success:
+                # BytesIO → bytes
+                if isinstance(result, io.BytesIO):
+                    result.seek(0)
+                    processed_bytes = result.read()
+                    logger.info(f"✅ DRM 처리 완료 ({len(processed_bytes):,} bytes)")
+                    return True, processed_bytes, "DRM 처리 완료"
+                else:
+                    logger.info("✅ DRM 없음 (원본 사용)")
+                    return True, pdf_bytes, "DRM 없음"
+            else:
+                error_msg = f"DRM 해제 실패: {result}"
+                logger.error(error_msg)
+                return False, pdf_bytes, error_msg
+        
+        except Exception as e:
+            error_msg = f"DRM 처리 중 오류: {e}"
+            logger.error(error_msg)
+            return False, pdf_bytes, error_msg
     
     @staticmethod
     def extract_page_count(pdf_bytes: bytes) -> int:
@@ -58,6 +112,65 @@ class PDFProcessor:
             return None
 
 
+class FallbackManager:
+    """페이지별 fallback 데이터 관리"""
+    
+    def __init__(self):
+        self.fallback_pairs = []
+        self.ecoli_count = 0
+        self.current_test_number = None
+        self.current_prescription_number = None
+    
+    def reset(self):
+        """페이지 넘어갈 때 초기화"""
+        self.fallback_pairs = []
+        self.ecoli_count = 0
+        self.current_test_number = None
+        self.current_prescription_number = None
+        logger.info("🔄 Fallback 초기화됨")
+    
+    def add_pairs(self, pairs: List[Tuple[str, str]]):
+        """fallback에 쌍 추가"""
+        self.fallback_pairs.extend(pairs)
+        logger.info(f"📦 Fallback 저장: {pairs} (전체: {len(self.fallback_pairs)}개)")
+    
+    def get_fallback_data(self, current_test=None, current_prescription=None):
+        """fallback에서 데이터 가져오기"""
+        original_test = current_test
+        original_prescription = current_prescription
+        
+        # 둘 다 비어있고 fallback이 있는 경우
+        if not current_test and not current_prescription and self.fallback_pairs:
+            fallback_pair = self.fallback_pairs.pop(0)  # FIFO
+            current_test, current_prescription = fallback_pair
+            logger.info(f"🔄 전체 Fallback 적용: {original_test}, {original_prescription} → {current_test}, {current_prescription}")
+        
+        # 시험번호만 비어있는 경우
+        elif not current_test and self.fallback_pairs:
+            for i, (fallback_test, fallback_prescription) in enumerate(self.fallback_pairs):
+                if fallback_test:
+                    current_test = fallback_test
+                    self.fallback_pairs.pop(i)
+                    logger.info(f"🔄 시험번호 Fallback 적용: {original_test} → {current_test}")
+                    break
+        
+        # 처방번호만 비어있는 경우
+        elif not current_prescription and self.fallback_pairs:
+            for i, (fallback_test, fallback_prescription) in enumerate(self.fallback_pairs):
+                if fallback_prescription:
+                    current_prescription = fallback_prescription
+                    self.fallback_pairs.pop(i)
+                    logger.info(f"🔄 처방번호 Fallback 적용: {original_prescription} → {current_prescription}")
+                    break
+        
+        return current_test, current_prescription
+    
+    def increment_ecoli_count(self):
+        """E.coli 카운터 증가"""
+        self.ecoli_count += 1
+        return self.ecoli_count
+    
+    
 class OCRProcessor:
     """OCR 처리 클래스"""
     
@@ -92,9 +205,13 @@ class OCRProcessor:
             return None
     
     @staticmethod
-    def parse_table_from_ocr(ocr_result: dict) -> Tuple[List[dict], dict]:
-        """OCR 결과에서 테이블 파싱"""
+    def parse_table_from_ocr(ocr_result: dict, fallback_manager: FallbackManager = None) -> Tuple[List[dict], dict]:
+        """OCR 결과에서 테이블 파싱 (fallback 지원)"""
         try:
+            # fallback_manager가 없으면 새로 생성
+            if fallback_manager is None:
+                fallback_manager = FallbackManager()
+            
             html_parts = []
             if 'elements' in ocr_result:
                 for element in ocr_result.get("elements", []):
@@ -104,6 +221,7 @@ class OCRProcessor:
                         html_parts.append(html)
             
             if not html_parts:
+                logger.warning("HTML 파트 없음")
                 return [], {}
             
             html_content = "<html><body>\n" + "\n".join(html_parts) + "\n</body></html>"
@@ -111,17 +229,19 @@ class OCRProcessor:
             table = soup.find('table')
             
             if not table:
+                logger.warning("테이블 없음")
                 return [], {}
             
             rows = table.find_all('tr')
             if len(rows) < 3:
+                logger.warning(f"행 부족 ({len(rows)}개)")
                 return [], {}
             
             # 날짜 정보 추출
             date_info = DataCleaner.extract_date_info(rows)
             
-            # 테이블 데이터 파싱
-            table_data = DataCleaner.parse_table_rows(rows)
+            # 🆕 fallback_manager 전달
+            table_data = DataCleaner.parse_table_rows(rows, fallback_manager)
             
             return table_data, date_info
             
@@ -133,14 +253,18 @@ class OCRProcessor:
 class DataCleaner:
     """데이터 정제 클래스"""
     
+    # 🆕 클래스 변수: 마지막 날짜 정보 저장
+    last_date_info = []
+    
     @staticmethod
     def extract_date_info(rows) -> dict:
         """
-        날짜 정보 추출 (개선 버전)
+        날짜 정보 추출 (개선 버전 + 이전 날짜 재사용)
         
         개선 사항:
         - 연속된 날짜 문자열 지원 추가
         - 기존 로직 유지
+        - 🆕 날짜 없으면 이전 페이지 날짜 재사용
         """
         date_info = {}
         if len(rows) >= 2:
@@ -157,6 +281,9 @@ class DataCleaner:
                         'date_14': consecutive_dates[2],
                         'date_28': consecutive_dates[3]
                     }
+                    # 🆕 성공하면 클래스 변수에 저장
+                    DataCleaner.last_date_info = date_info.copy()
+                    logger.info(f"📅 날짜 정보 추출 성공: {date_info}")
                     return date_info
                 
                 # 기존 방식 (단일 날짜 파싱)
@@ -169,24 +296,75 @@ class DataCleaner:
                         'date_14': (first_date + timedelta(days=14)).strftime("%m/%d"),
                         'date_28': (first_date + timedelta(days=28)).strftime("%m/%d")
                     }
-        return date_info
+                    # 🆕 성공하면 클래스 변수에 저장
+                    DataCleaner.last_date_info = date_info.copy()
+                    logger.info(f"📅 날짜 정보 추출 성공: {date_info}")
+                    return date_info
+        
+        # 🆕 날짜 정보 추출 실패 시 이전 값 재사용
+        if DataCleaner.last_date_info:
+            logger.info(f"🔄 이전 날짜 정보 재사용: {DataCleaner.last_date_info}")
+            return DataCleaner.last_date_info.copy()
+        
+        logger.warning("⚠️ 날짜 정보 없음")
+        return {}
     
     @staticmethod
-    def parse_table_rows(rows) -> List[dict]:
-        """테이블 행 파싱"""
+    def parse_table_rows(rows, fallback_manager: FallbackManager = None) -> List[dict]:
+        """테이블 행 파싱 (fallback 지원)"""
         table_data = []
-        current_test_number = None
-        current_prescription_number = None
         
-        for i, row in enumerate(rows[2:], start=3):
+        # fallback_manager가 없으면 새로 생성
+        if fallback_manager is None:
+            fallback_manager = FallbackManager()
+        
+        # 동적 시작점 찾기
+        data_start_row = 2
+        for i, row in enumerate(rows):
             cells = row.find_all('td')
-            if len(cells) < 2:
+            if cells and cells[0].get('rowspan') and len(cells[0].text.strip()) > 10:
+                data_start_row = i
+                logger.info(f"🔍 데이터 시작점 감지: Row {i}")
+                break
+        
+        # 데이터 행 처리
+        for i, row in enumerate(rows[data_start_row:], start=data_start_row+1):
+            cells = row.find_all('td')
+            if len(cells) < 1:
                 continue
             
             # Bulk Name 행 감지
-            if cells[0].get('rowspan') and cells[0].text.strip():
+            has_bulk_name = cells[0].get('rowspan') and cells[0].text.strip()
+            
+            if has_bulk_name:
+                # ==================== Bulk Name 있는 행 ====================
                 bulk_name = cells[0].text.strip()
-                current_test_number, current_prescription_number = DataCleaner.extract_numbers(bulk_name)
+                
+                # 🆕 다중 패턴 감지
+                test_numbers, prescription_numbers = DataCleaner.extract_multiple_numbers(bulk_name)
+                
+                if len(test_numbers) > 1 or len(prescription_numbers) > 1:
+                    logger.info(f"🔍 다중 패턴 감지 - Bulk Name: {bulk_name}")
+                    logger.info(f"   시험번호들: {test_numbers}")
+                    logger.info(f"   처방번호들: {prescription_numbers}")
+                    
+                    # 🆕 쌍 생성
+                    pairs = DataCleaner.create_matched_pairs(test_numbers, prescription_numbers, bulk_name)
+                    
+                    if pairs:
+                        # 첫 번째 쌍 사용
+                        fallback_manager.current_test_number, fallback_manager.current_prescription_number = pairs[0]
+                        
+                        # 나머지 fallback에 저장
+                        if len(pairs) > 1:
+                            fallback_manager.add_pairs(pairs[1:])
+                    else:
+                        fallback_manager.current_test_number = test_numbers[0] if test_numbers else None
+                        fallback_manager.current_prescription_number = prescription_numbers[0] if prescription_numbers else None
+                else:
+                    # 단일 패턴
+                    fallback_manager.current_test_number = test_numbers[0] if test_numbers else None
+                    fallback_manager.current_prescription_number = prescription_numbers[0] if prescription_numbers else None
                 
                 if len(cells) > 1:
                     strain = cells[1].text.strip()
@@ -194,10 +372,21 @@ class DataCleaner:
                 else:
                     continue
             else:
-                if len(cells) < 1:
-                    continue
+                # ==================== Bulk Name 없는 행 ====================
                 strain = cells[0].text.strip()
                 cfu_indices = {'0일': 2, '7일': 3, '14일': 4, '28일': 5, '판정': 6, '최종판정': 7}
+                
+                # 🆕 E.coli 감지 시 fallback 적용
+                if 'E.coli' in strain or 'Escherichia' in strain:
+                    ecoli_count = fallback_manager.increment_ecoli_count()
+                    logger.info(f"🔍 E.coli #{ecoli_count} 감지: {strain}")
+                    
+                    # 두 번째 E.coli부터 fallback 적용
+                    if ecoli_count > 1 and fallback_manager.fallback_pairs:
+                        new_test, new_prescription = fallback_manager.get_fallback_data(None, None)
+                        fallback_manager.current_test_number = new_test
+                        fallback_manager.current_prescription_number = new_prescription
+                        logger.info(f"🔄 E.coli #{ecoli_count} Fallback 적용: {new_test}, {new_prescription}")
             
             # 유효한 균주 확인
             valid_strains = STRAINS + ['Escherichia', 'Pseudomonas', 'Staphylococcus', 'Candida', 'Aspergillus']
@@ -208,8 +397,8 @@ class DataCleaner:
             
             # CFU 데이터 추출
             row_data = {
-                'test_number': current_test_number or '',
-                'prescription_number': current_prescription_number or '',
+                'test_number': fallback_manager.current_test_number or '',
+                'prescription_number': fallback_manager.current_prescription_number or '',
                 'strain': strain_normalized,
                 'cfu_0day': DataCleaner.clean_cfu_value(
                     cells[cfu_indices['0일']].text.strip() if len(cells) > cfu_indices['0일'] else "", 
@@ -259,12 +448,21 @@ class DataCleaner:
             
             # ======== 처방번호 패턴 (확장) ========
             prescription_patterns = [
-                r'\b[A-Z]{2,4}\d{4,5}[A-Z]?-[A-Z]{1,5}\d?\b',
+                r'\b[A-Z]{2,4}\d{4,5}[A-Z]?-[A-Z]{1,4}\d?\b',
                 r'\b[A-Z]{3}\d{5}-[A-Z]{2,4}\b',
+                r'\bM-[A-Z]{2,4}\d{4,5}-[A-Z]{1,4}\d?\b',
+                r'\b[A-Z]{2,4}\d{4,5}[A-Z]-[A-Z]{1,4}[A-Z]?\b',
+                r'\b[A-Z]{3,6}\d{2,4}-[A-Z]{1,4}\b',
                 r'\b[A-Z]{2,4}\d{3,6}-[A-Z]{1,5}\b',
                 r'\b[A-Z]{2,5}\d{4}-[A-Z]{1,3}\d{0,2}\b',
-                r'\b[A-Z]{2,4}\d{4,5}[A-Z]?-\s*[A-Z]{1,5}\d?\b',  # 공백 허용
-                r'\b[A-Z]{2,4}\d{3,5}-[A-Z]{1,4}\d{1,2}\b',  # AZLY1 타입
+                r'\b[A-Z]{1,3}\d{4,5}-[A-Z]{2,4}[A-Z]?\b',
+                r'\b[A-Z]{2,4}\d{4}-[A-Z]\d[A-Z]{1,3}\b',
+                r'\b[A-Z]{2,4}\d{3,4}[A-Z]?-[A-Z]{1,4}\d*\b',
+                r'\b[A-Z]{2,4}\d{4,5}[A-Z]?-[A-Z]{1,5}\d?\b',
+                r'\b[A-Z]{2,4}\d{4,5}[A-Z]?-\s*[A-Z]{1,5}\d?\b',
+                r'\b[A-Z]{2,4}\d{4,5}[A-Z]?-[A-Z]{1,5}\d[A-Z]+\b',
+                r'\b[A-Z]{2,4}\d{3,5}-[A-Z]{1,4}\d{1,2}\b',  # 🎯 AZLY1 타입
+                r'\b[A-Z]{2,5}\d{3,5}-[A-Z]{2,5}[A-Z\d]*\b',  # 🎯 VAZAA 타입
             ]
             
             all_prescription_matches = []
@@ -315,6 +513,116 @@ class DataCleaner:
         except Exception as e:
             logger.warning(f"번호 추출 중 오류: {e}")
             return None, None
+    
+    
+    @staticmethod
+    def extract_multiple_numbers(bulk_name: str) -> Tuple[List[str], List[str]]:
+        """
+        Bulk Name에서 다중 시험번호와 처방번호 추출
+        
+        Returns:
+            (시험번호 리스트, 처방번호 리스트)
+        """
+        try:
+            # 전처리
+            bulk_name = bulk_name.upper()
+            bulk_name = bulk_name.replace('!', 'I')
+            bulk_name = re.sub(r'-\s+', '-', bulk_name)
+            bulk_name = re.sub(r'\s+', ' ', bulk_name)
+            
+            # 처방번호 패턴 (15개)
+            prescription_patterns = [
+                r'\b[A-Z]{2,4}\d{4,5}[A-Z]?-[A-Z]{1,4}\d?\b',
+                r'\b[A-Z]{3}\d{5}-[A-Z]{2,4}\b',
+                r'\bM-[A-Z]{2,4}\d{4,5}-[A-Z]{1,4}\d?\b',
+                r'\b[A-Z]{2,4}\d{4,5}[A-Z]-[A-Z]{1,4}[A-Z]?\b',
+                r'\b[A-Z]{3,6}\d{2,4}-[A-Z]{1,4}\b',
+                r'\b[A-Z]{2,4}\d{3,6}-[A-Z]{1,5}\b',
+                r'\b[A-Z]{2,5}\d{4}-[A-Z]{1,3}\d{0,2}\b',
+                r'\b[A-Z]{1,3}\d{4,5}-[A-Z]{2,4}[A-Z]?\b',
+                r'\b[A-Z]{2,4}\d{4}-[A-Z]\d[A-Z]{1,3}\b',
+                r'\b[A-Z]{2,4}\d{3,4}[A-Z]?-[A-Z]{1,4}\d*\b',
+                r'\b[A-Z]{2,4}\d{4,5}[A-Z]?-[A-Z]{1,5}\d?\b',
+                r'\b[A-Z]{2,4}\d{4,5}[A-Z]?-\s*[A-Z]{1,5}\d?\b',
+                r'\b[A-Z]{2,4}\d{4,5}[A-Z]?-[A-Z]{1,5}\d[A-Z]+\b',
+                r'\b[A-Z]{2,4}\d{3,5}-[A-Z]{1,4}\d{1,2}\b',
+                r'\b[A-Z]{2,5}\d{3,5}-[A-Z]{2,5}[A-Z\d]*\b',
+            ]
+            
+            all_prescription_matches = []
+            for pattern in prescription_patterns:
+                matches = re.findall(pattern, bulk_name)
+                all_prescription_matches.extend(matches)
+            
+            # 시험번호 패턴
+            test_patterns = [
+                r'\b(\d{2}[A-L]\d{2}I\d{2,3})\b',  # 정상
+                r'\b(\d{2}[A-L]\d{2}1\d{2,3})\b',  # I→1 오인
+            ]
+            
+            all_test_matches = []
+            for pattern in test_patterns:
+                matches = re.findall(pattern, bulk_name)
+                for match in matches:
+                    if '1' in match[5:7]:
+                        corrected = match[:5] + 'I' + match[6:]
+                        all_test_matches.append(corrected)
+                        logger.info(f"🔧 OCR I/1 보정: '{match}' → '{corrected}'")
+                    else:
+                        all_test_matches.append(match)
+            
+            # 중복 제거
+            all_test_matches = list(dict.fromkeys(all_test_matches))
+            all_prescription_matches = list(dict.fromkeys(all_prescription_matches))
+            
+            return all_test_matches, all_prescription_matches
+            
+        except Exception as e:
+            logger.error(f"다중 번호 추출 오류: {e}")
+            return [], []
+
+    @staticmethod
+    def create_matched_pairs(test_numbers: List[str], prescription_numbers: List[str], bulk_name: str) -> List[Tuple[str, str]]:
+        """
+        시험번호와 처방번호 매칭 (위치 기반)
+        
+        Returns:
+            [(시험번호, 처방번호), ...] 쌍 리스트
+        """
+        pairs = []
+        
+        try:
+            # 위치 기반 매칭
+            test_positions = []
+            for test_num in test_numbers:
+                pos = bulk_name.find(test_num)
+                if pos != -1:
+                    test_positions.append((test_num, pos))
+            
+            prescription_positions = []
+            for prescription_num in prescription_numbers:
+                pos = bulk_name.find(prescription_num)
+                if pos != -1:
+                    prescription_positions.append((prescription_num, pos))
+            
+            # 순서대로 매칭
+            for i, test_num in enumerate(test_numbers):
+                if i < len(prescription_numbers):
+                    pairs.append((test_num, prescription_numbers[i]))
+                else:
+                    pairs.append((test_num, None))
+            
+            # 잉여 처방번호 처리
+            if len(prescription_numbers) > len(test_numbers):
+                for i in range(len(test_numbers), len(prescription_numbers)):
+                    pairs.append((None, prescription_numbers[i]))
+            
+            logger.info(f"📍 매칭 결과: {pairs}")
+            return pairs
+            
+        except Exception as e:
+            logger.error(f"쌍 매칭 오류: {e}")
+            return []
     
     @staticmethod
     def normalize_strain_name(strain: str) -> str:
@@ -525,7 +833,7 @@ class DataCleaner:
         except Exception as e:
             logger.warning(f"Log 변환 실패: {cfu_value}, 오류: {e}")
             return cfu_value
-
+        
 
 class ExcelIncrementalSaver:
     """
@@ -617,9 +925,6 @@ class ExcelIncrementalSaver:
         try:
             from openpyxl import load_workbook
             
-            # Excel 파일 로드
-            workbook = load_workbook(self.output_path)
-            
             # DataFrame으로 변환
             if isinstance(test_data, pd.DataFrame):
                 df = test_data
@@ -633,40 +938,69 @@ class ExcelIncrementalSaver:
                 logger.warning("⚠️ 빈 데이터 - 저장 건너뛰기")
                 return False
             
-            # 시험번호 추출
-            test_number = df.iloc[0].get('test_number', '')
-            if not test_number:
-                test_number = "Unknown_Test"
-                logger.warning(f"⚠️ 시험번호 없음 - 기본값 사용: {test_number}")
+            # 🆕 시험번호 컬럼 확인
+            if 'test_number' not in df.columns:
+                logger.error("❌ test_number 컬럼이 없습니다")
+                return False
             
-            # 중복 시트명 처리
-            sheet_name = str(test_number)
-            counter = 1
-            original_name = sheet_name
-            while sheet_name in workbook.sheetnames:
-                sheet_name = f"{original_name}_{counter}"
-                counter += 1
+            # 🆕 시험번호별로 그룹핑
+            test_numbers = df['test_number'].dropna().unique()
             
-            # 🆕 템플릿 시트 복사하여 새 시트 생성
-            if "TEMPLATE_BASE" in workbook.sheetnames:
-                template_sheet = workbook["TEMPLATE_BASE"]
-                new_sheet = workbook.copy_worksheet(template_sheet)
-                new_sheet.title = sheet_name
-                logger.info(f"✅ 템플릿 시트 복사 완료: {sheet_name}")
-            else:
-                # 템플릿이 없으면 빈 시트 생성
-                new_sheet = workbook.create_sheet(title=sheet_name)
-                logger.warning(f"⚠️ 템플릿 없이 빈 시트 생성: {sheet_name}")
+            if len(test_numbers) == 0:
+                logger.warning("⚠️ 유효한 시험번호가 없습니다")
+                return False
             
-            # 데이터 매핑
-            self._map_data_to_sheet(new_sheet, df, date_info)
+            logger.info(f"📋 {len(test_numbers)}개 시험번호 발견: {list(test_numbers)}")
+            
+            # Excel 파일 로드
+            workbook = load_workbook(self.output_path)
+            
+            success_count = 0
+            
+            # 🆕 각 시험번호별로 처리
+            for test_number in test_numbers:
+                if not test_number or str(test_number).strip() == '':
+                    continue
+                
+                # 해당 시험번호의 데이터만 추출
+                df_subset = df[df['test_number'] == test_number].copy()
+                
+                if df_subset.empty:
+                    logger.warning(f"⚠️ {test_number}: 데이터 없음")
+                    continue
+                
+                logger.info(f"🔄 {test_number} 처리 중... ({len(df_subset)}개 행)")
+                
+                # 중복 시트명 처리
+                sheet_name = str(test_number)
+                counter = 1
+                original_name = sheet_name
+                while sheet_name in workbook.sheetnames:
+                    sheet_name = f"{original_name}_{counter}"
+                    counter += 1
+                
+                # 🆕 템플릿 시트 복사하여 새 시트 생성
+                if "TEMPLATE_BASE" in workbook.sheetnames:
+                    template_sheet = workbook["TEMPLATE_BASE"]
+                    new_sheet = workbook.copy_worksheet(template_sheet)
+                    new_sheet.title = sheet_name
+                    logger.info(f"✅ 템플릿 시트 복사 완료: {sheet_name}")
+                else:
+                    # 템플릿이 없으면 빈 시트 생성
+                    new_sheet = workbook.create_sheet(title=sheet_name)
+                    logger.warning(f"⚠️ 템플릿 없이 빈 시트 생성: {sheet_name}")
+                
+                # 데이터 매핑 (해당 시험번호의 데이터만)
+                self._map_data_to_sheet(new_sheet, df_subset, date_info)
+                
+                success_count += 1
             
             # 즉시 저장
             workbook.save(self.output_path)
             workbook.close()
             
-            logger.info(f"💾 Excel 저장 완료: {sheet_name} 시트 추가")
-            return True
+            logger.info(f"💾 Excel 저장 완료: {success_count}개 시트 추가")
+            return success_count > 0
             
         except Exception as e:
             logger.error(f"❌ Excel 저장 실패: {e}")
@@ -860,8 +1194,8 @@ class ExcelIncrementalSaver:
             }
 
 # 편의 함수
-def process_pdf_page(pdf_bytes: bytes, page_index: int) -> dict:
-    """PDF 페이지 전체 처리 파이프라인"""
+def process_pdf_page(pdf_bytes: bytes, page_index: int, fallback_manager=None) -> dict:
+    """PDF 페이지 전체 처리 파이프라인 (fallback 지원)"""
     result = {
         'success': False,
         'data': [],
@@ -870,8 +1204,21 @@ def process_pdf_page(pdf_bytes: bytes, page_index: int) -> dict:
     }
     
     try:
+                # 🆕 0단계: DRM 처리
+        drm_success, processed_pdf_bytes, drm_message = PDFProcessor.process_drm_if_needed(pdf_bytes)
+        
+        if not drm_success:
+            result['message'] = drm_message
+            return result
+        
+        logger.info(f"📄 DRM 처리 결과: {drm_message}")
+        
+        # 🆕 fallback_manager가 없으면 새로 생성
+        if fallback_manager is None:
+            fallback_manager = FallbackManager()
+            
         # 1. 이미지 렌더링
-        img_bytes = PDFProcessor.render_page_image(pdf_bytes, page_index)
+        img_bytes = PDFProcessor.render_page_image(processed_pdf_bytes, page_index)
         if not img_bytes:
             result['message'] = "이미지 렌더링 실패"
             return result
@@ -882,8 +1229,8 @@ def process_pdf_page(pdf_bytes: bytes, page_index: int) -> dict:
             result['message'] = "OCR 처리 실패"
             return result
         
-        # 3. 테이블 파싱
-        table_data, date_info = OCRProcessor.parse_table_from_ocr(ocr_result)
+        # 3. 테이블 파싱 (🆕 fallback_manager 전달)
+        table_data, date_info = OCRProcessor.parse_table_from_ocr(ocr_result, fallback_manager)
         
         result['success'] = True
         result['data'] = table_data

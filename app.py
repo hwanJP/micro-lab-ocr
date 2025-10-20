@@ -15,6 +15,7 @@ from backend import (
     process_pdf_page,
     ExcelIncrementalSaver,  # 🆕 추가
     STRAINS,
+    FallbackManager,
     logger
 )
 
@@ -35,7 +36,29 @@ if "ocr_data_frames" not in st.session_state:
 if "current_page" not in st.session_state:
     st.session_state.current_page = 1
 
-# 🆕 Excel 증분 저장 객체 초기화
+if "saved_pages" not in st.session_state:
+    st.session_state.saved_pages = set()
+    
+
+# 🆕 마지막 날짜 정보 저장
+if "last_date_info" not in st.session_state:
+    st.session_state.last_date_info = {}
+    
+# 🆕 페이지별 fallback 관리자
+if "fallback_manager" not in st.session_state:
+    from backend import FallbackManager
+    st.session_state.fallback_manager = FallbackManager()
+
+# 🆕 파일 관련 세션
+if "current_file_name" not in st.session_state:
+    st.session_state.current_file_name = None
+
+if "current_file_bytes" not in st.session_state:
+    st.session_state.current_file_bytes = None
+
+if "confirm_reset" not in st.session_state:
+    st.session_state.confirm_reset = False
+
 if "excel_saver" not in st.session_state:
     temp_dir = tempfile.gettempdir()
     excel_path = os.path.join(temp_dir, f"보존력시험_{st.session_state.session_id}.xlsx")
@@ -122,28 +145,98 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# 파일 업로드
-uploaded_files = st.file_uploader(
-    "PDF 파일 선택",
-    type=["pdf"],
-    accept_multiple_files=True,
-    label_visibility="collapsed"
-)
+# ==================== 파일 업로드 영역 ====================
+header_col1, header_col2 = st.columns([4, 1])
 
-# 현재 파일 및 페이지 설정
+with header_col1:
+    # 작업 중인지 확인
+    has_work = len(st.session_state.ocr_data_frames) > 0
+    
+    if not has_work:
+        # 작업 전: 파일 업로드 가능
+        uploaded_file = st.file_uploader(
+            "PDF 파일 선택",
+            type=["pdf"],
+            accept_multiple_files=False,
+            label_visibility="collapsed",
+            key="file_uploader"
+        )
+        
+        if uploaded_file:
+            # 🆕 파일이 변경되었는지 확인
+            if st.session_state.current_file_name != uploaded_file.name:
+                # 🆕 DRM 처리 추가
+                with st.spinner("🔐 파일 확인 중..."):
+                    # 원본 파일 bytes
+                    original_bytes = uploaded_file.getvalue()
+                    
+                    # DRM 처리
+                    drm_success, processed_bytes, drm_message = PDFProcessor.process_drm_if_needed(original_bytes)
+                    
+                    if not drm_success:
+                        st.error(f"❌ 파일 처리 실패: {drm_message}")
+                        logger.error(f"DRM 처리 실패: {drm_message}")
+                        st.stop()
+                    
+                    # DRM 처리된 파일 저장
+                    st.session_state.current_file_name = uploaded_file.name
+                    st.session_state.current_file_bytes = processed_bytes  # ← DRM 해제된 bytes
+                    st.session_state.current_page = 1
+                    
+                    # 사용자에게 알림
+                    if "DRM 처리 완료" in drm_message or "DRM 해제" in drm_message:
+                        st.success(f"✅ {drm_message}")
+                        logger.info(f"📁 DRM 파일 업로드 및 해제 완료: {uploaded_file.name}")
+                    else:
+                        logger.info(f"📁 일반 파일 업로드: {uploaded_file.name}")
+                    
+                    st.rerun()
+
+with header_col2:
+    if has_work:
+        # 🆕 새로 시작하기 버튼
+        if st.button("🔄 새로 시작하기", use_container_width=True, type="secondary"):
+            if st.session_state.get('confirm_reset', False):
+                # 전체 초기화
+                st.session_state.ocr_data_frames = {}
+                st.session_state.saved_pages = set()
+                st.session_state.current_page = 1
+                st.session_state.last_date_info = {}
+                st.session_state.fallback_manager.reset()
+                st.session_state.current_file_name = None
+                st.session_state.current_file_bytes = None
+                st.session_state.confirm_reset = False
+                
+                # Excel 초기화
+                temp_dir = tempfile.gettempdir()
+                excel_path = os.path.join(temp_dir, f"보존력시험_{st.session_state.session_id}.xlsx")
+                st.session_state.excel_saver = ExcelIncrementalSaver(
+                    output_path=excel_path,
+                    template_file=None
+                )
+                st.session_state.excel_path = excel_path
+                
+                logger.info("🔄 전체 초기화 완료")
+                st.success("✅ 새로 시작합니다")
+                st.rerun()
+            else:
+                st.session_state.confirm_reset = True
+                st.warning("⚠️ 작업 내용이 삭제됩니다. 다시 클릭하면 초기화됩니다.")
+                st.rerun()
+
+# 🆕 현재 파일 설정
 current_file = None
 page_count = 0
 
-if uploaded_files:
-    file_names = [f.name for f in uploaded_files]
-    if len(file_names) > 1:
-        selected_file_name = st.selectbox("현재 파일", file_names, label_visibility="collapsed")
-    else:
-        selected_file_name = file_names[0]
-        st.info(f"선택된 파일: {selected_file_name}")
+if st.session_state.get('current_file_bytes'):
+    # 세션에서 파일 로드
+    import io
+    current_file = type('obj', (object,), {
+        'name': st.session_state.current_file_name,
+        'getvalue': lambda self: st.session_state.current_file_bytes  # self 추가!
+    })()
     
-    current_file = next(f for f in uploaded_files if f.name == selected_file_name)
-    page_count = PDFProcessor.extract_page_count(current_file.getvalue())
+    page_count = PDFProcessor.extract_page_count(st.session_state.current_file_bytes)
     
     if st.session_state.current_page > page_count:
         st.session_state.current_page = page_count
@@ -176,12 +269,37 @@ if current_file:
     with action_col1:
         if st.button("OCR 시작", type="primary", use_container_width=True):
             with st.spinner(f"페이지 {st.session_state.current_page} 처리 중..."):
-                result = process_pdf_page(current_file.getvalue(), st.session_state.current_page - 1)
+                # 🆕 DRM 처리 상태 표시
+                drm_placeholder = st.empty()
+                drm_placeholder.info("🔐 DRM 확인 중...")
+                
+                result = process_pdf_page(
+                    current_file.getvalue(), 
+                    st.session_state.current_page - 1,
+                    st.session_state.fallback_manager  # 🎯 추가
+                )
+                
+                drm_placeholder.empty()  # DRM 메시지 제거
                 
                 if result['success']:
                     key = (current_file.name, st.session_state.current_page)
                     df_table = pd.DataFrame(result['data'])
-                    df_date = pd.DataFrame([result['date_info']]) if result['date_info'] else pd.DataFrame()
+                    df_date_raw = result['date_info']  # 딕셔너리
+                    
+                    # 🆕 날짜 정보 처리
+                    if df_date_raw and any(df_date_raw.values()):
+                        # 새로운 날짜 정보가 있으면 저장
+                        st.session_state.last_date_info = df_date_raw.copy()
+                        df_date = pd.DataFrame([df_date_raw])
+                        logger.info(f"📅 새로운 날짜 정보 저장: {df_date_raw}")
+                    elif st.session_state.last_date_info:
+                        # 날짜 정보가 없으면 이전 값 재사용
+                        df_date = pd.DataFrame([st.session_state.last_date_info])
+                        logger.info(f"🔄 이전 날짜 정보 재사용: {st.session_state.last_date_info}")
+                    else:
+                        # 날짜 정보가 전혀 없는 경우
+                        df_date = pd.DataFrame()
+                        logger.warning("⚠️ 날짜 정보 없음")
                     
                     st.session_state.ocr_data_frames[key] = {"table": df_table, "date": df_date}
                     
@@ -193,13 +311,11 @@ if current_file:
     with action_col2:
         key = (current_file.name, st.session_state.current_page)
         if key in st.session_state.ocr_data_frames:
-            if st.button("OCR결과 수정 완료", use_container_width=True):
-                # 🆕 즉시 Excel에 저장
+            if st.button("Excel에 저장", use_container_width=True):
                 bundle = st.session_state.ocr_data_frames[key]
                 df_table = bundle.get("table", pd.DataFrame())
                 df_date = bundle.get("date", pd.DataFrame())
                 
-                # 날짜 정보 추출
                 date_info = {}
                 if not df_date.empty:
                     date_row = df_date.iloc[0]
@@ -210,76 +326,77 @@ if current_file:
                         'date_28': date_row.get('date_28', '')
                     }
                 
-                # Excel 증분 저장
                 success = st.session_state.excel_saver.add_test_data(df_table, date_info)
                 
                 if success:
-                    st.success("수정 사항이 Excel에 저장되었습니다")
+                    # 🆕 저장 완료 기록
+                    st.session_state.saved_pages.add(key)
                     
-                    # 저장된 시트 목록 표시
+                    if not df_table.empty and 'test_number' in df_table.columns:
+                        test_count = df_table['test_number'].nunique()
+                        st.success(f"{test_count}개 시험이 저장되었습니다")
+                    else:
+                        st.success("저장되었습니다")
+                    
                     sheet_list = st.session_state.excel_saver.get_sheet_list()
                     if sheet_list:
-                        st.info(f"저장된 시트: {len(sheet_list)}개")
+                        st.info(f"총 저장된 시트: {len(sheet_list)}개")
                 else:
                     st.error("Excel 저장 실패")
                 
                 st.rerun()
         else:
-            st.button("OCR결과 수정 완료", use_container_width=True, disabled=True)
+            st.button("Excel에 저장", use_container_width=True, disabled=True)
     
+
     with action_col3:
-        # Excel 생성 버튼은 유지 (기존 방식과 호환)
-        if st.session_state.ocr_data_frames:
-            if st.button("Excel 생성", use_container_width=True):
-                with st.spinner("Excel 생성 중..."):
-                    all_dfs = []
-                    for (file_name, page_num), bundle in st.session_state.ocr_data_frames.items():
-                        if isinstance(bundle, pd.DataFrame):
-                            df_copy = bundle.copy()
-                        else:
-                            df_copy = bundle.get("table", pd.DataFrame()).copy()
-                        all_dfs.append(df_copy)
-                    
-                    if all_dfs:
-                        combined_df = pd.concat(all_dfs, ignore_index=True)
-                        data_list = combined_df.to_dict('records')
-                        excel_bytes = ExcelGenerator.create_excel(data_list)
-                        
-                        if excel_bytes:
-                            st.session_state['combined_excel_data'] = excel_bytes
-                            st.success("Excel 생성 완료")
-                        else:
-                            st.error("Excel 생성 실패")
+        # 비활성 버튼으로 통계 표시 (평행 정렬)
+        if st.session_state.excel_saver:
+            stats = st.session_state.excel_saver.get_statistics()
+            sheet_count = stats['test_sheets']
         else:
-            st.button("Excel 생성", use_container_width=True, disabled=True)
+            sheet_count = 0
+        
+        st.button(f"저장: {sheet_count}개", use_container_width=True, disabled=True)
     
     with action_col4:
-        if st.button("다음", use_container_width=True):
-            if st.session_state.current_page < page_count:
-                st.session_state.current_page += 1
-                st.rerun()
+        key = (current_file.name, st.session_state.current_page)
+        
+        # 🆕 저장 여부 확인
+        is_saved = key in st.session_state.saved_pages
+        has_data = key in st.session_state.ocr_data_frames
+        
+        # 데이터는 있지만 저장 안된 경우
+        if has_data and not is_saved:
+            st.button("다음", use_container_width=True, disabled=True)
+            st.caption("저장 후 이동")
+        # 저장됨 또는 데이터 없음
+        else:
+            if st.button("다음", use_container_width=True):
+                if st.session_state.current_page < page_count:
+                    st.session_state.current_page += 1
+                    # 🆕 여기 2줄 추가 (시작)
+                    st.session_state.fallback_manager.reset()
+                    logger.info(f"▶ 페이지 {st.session_state.current_page}로 이동 - Fallback 초기화")
+
+                    st.rerun()
     
     with action_col5:
-        # 🆕 증분 저장된 Excel 다운로드 (우선)
+        # 증분 저장된 Excel 다운로드
         if os.path.exists(st.session_state.excel_path):
             excel_bytes = st.session_state.excel_saver.get_excel_bytes()
             if excel_bytes:
+                # 🆕 파일 크기 표시
+                stats = st.session_state.excel_saver.get_statistics()
+                file_size_mb = stats.get('file_size_mb', 0)
+                
                 st.download_button(
-                    label="Excel 다운로드",
+                    label=f"Excel 다운로드 ({file_size_mb}MB)",
                     data=excel_bytes,
                     file_name=f"보존력시험_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True
                 )
-        # 기존 방식 Excel도 지원
-        elif 'combined_excel_data' in st.session_state:
-            st.download_button(
-                label="Excel 다운로드",
-                data=st.session_state['combined_excel_data'],
-                file_name=f"보존력시험_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True
-            )
         else:
             st.button("Excel 다운로드", use_container_width=True, disabled=True)
     
@@ -326,7 +443,6 @@ if current_file:
         if img_bytes:
             st.image(
                 img_bytes,
-                use_container_width=True,
                 caption=f"{current_file.name} - 페이지 {st.session_state.current_page}/{page_count}"
             )
         else:
@@ -348,19 +464,54 @@ if current_file:
                 df_table = bundle.get("table", pd.DataFrame())
                 df_date = bundle.get("date", pd.DataFrame())
             
-            # 날짜 정보
+            # 🆕 날짜 정보 항상 표시
             if not df_date.empty and any(df_date.iloc[0].notna()):
                 st.markdown("**날짜 정보**")
                 date_display = df_date.copy()
                 date_display.columns = ['0일', '7일', '14일', '28일']
                 st.dataframe(date_display, use_container_width=True, height=80)
-                st.markdown("---")
+            elif st.session_state.last_date_info:
+                # 현재 페이지에 날짜 없으면 이전 값 표시
+                st.markdown("**날짜 정보** (이전 페이지)")
+                date_display = pd.DataFrame([{
+                    '0일': st.session_state.last_date_info.get('date_0', ''),
+                    '7일': st.session_state.last_date_info.get('date_7', ''),
+                    '14일': st.session_state.last_date_info.get('date_14', ''),
+                    '28일': st.session_state.last_date_info.get('date_28', '')
+                }])
+                st.dataframe(date_display, use_container_width=True, height=80)
+                st.caption("이전 페이지의 날짜 정보를 사용합니다")
+            else:
+                st.warning("날짜 정보 없음")
             
             # 데이터 테이블
             if not df_table.empty:
+                
+                # 🆕 표시용 DataFrame 생성 (중복 제거)
+                df_display = df_table.copy()
+                
+                # 시험번호 중복 제거
+                prev_test = None
+                for i in range(len(df_display)):
+                    curr = df_display.iloc[i]['test_number']
+                    if curr == prev_test:
+                        df_display.at[df_display.index[i], 'test_number'] = ''
+                    else:
+                        prev_test = curr
+                
+                # 처방번호 중복 제거
+                if 'prescription_number' in df_display.columns:
+                    prev_presc = None
+                    for i in range(len(df_display)):
+                        curr = df_display.iloc[i]['prescription_number']
+                        if curr == prev_presc:
+                            df_display.at[df_display.index[i], 'prescription_number'] = ''
+                        else:
+                            prev_presc = curr
+                
                 col_config = {
                     'test_number': st.column_config.TextColumn("시험번호", width="small"),
-                    'prescription_number': st.column_config.TextColumn("처방번호", width="medium"),
+                    'prescription_number': st.column_config.TextColumn("처방번호", width="small"),
                     'strain': st.column_config.SelectboxColumn("균주", options=STRAINS, width="small"),
                     'cfu_0day': st.column_config.TextColumn("0일 CFU", width="small"),
                     'cfu_7day': st.column_config.TextColumn("7일 CFU", width="small"),
@@ -371,27 +522,40 @@ if current_file:
                 }
                 
                 edited_df = st.data_editor(
-                    df_table,
+                    df_display,
                     column_config=col_config,
                     num_rows="dynamic",
                     hide_index=True,
                     key=f"editor_{current_file.name}_{st.session_state.current_page}",
                     use_container_width=True,
-                    height=500
+                    height=700
                 )
                 
                 # 편집된 데이터 저장
-                st.session_state.ocr_data_frames[key] = {"table": edited_df, "date": df_date}
+                # 🆕 편집 데이터 복원 (빈 값 채우기)
+                edited_restored = edited_df.copy()
                 
-                # 통계
-                st.markdown("---")
-                stat_col1, stat_col2, stat_col3 = st.columns(3)
-                with stat_col1:
-                    st.metric("총 데이터", len(edited_df))
-                with stat_col2:
-                    st.metric("시험번호", edited_df['test_number'].nunique())
-                with stat_col3:
-                    st.metric("균주 종류", edited_df['strain'].nunique())
+                prev_test = None
+                for i in range(len(edited_restored)):
+                    curr = edited_restored.iloc[i]['test_number']
+                    if curr == '' or pd.isna(curr):
+                        edited_restored.at[edited_restored.index[i], 'test_number'] = prev_test
+                    else:
+                        prev_test = curr
+                
+                if 'prescription_number' in edited_restored.columns:
+                    prev_presc = None
+                    for i in range(len(edited_restored)):
+                        curr = edited_restored.iloc[i]['prescription_number']
+                        if curr == '' or pd.isna(curr):
+                            edited_restored.at[edited_restored.index[i], 'prescription_number'] = prev_presc
+                        else:
+                            prev_presc = curr
+                
+                # 편집된 데이터 저장
+                st.session_state.ocr_data_frames[key] = {"table": edited_restored, "date": df_date}  # 🆕 변경
+                
+                            
                 
             else:
                 st.info("OCR 결과 데이터가 없습니다. OCR 시작 버튼을 클릭하세요.")
@@ -399,17 +563,6 @@ if current_file:
         else:
             st.info("OCR 결과 데이터가 없습니다. OCR 시작 버튼을 클릭하세요.")
     
-    # 🆕 하단에 저장된 시트 목록 표시
-    if st.session_state.excel_saver:
-        sheet_list = st.session_state.excel_saver.get_sheet_list()
-        if sheet_list:
-            st.markdown("---")
-            st.markdown("### 저장된 시트 목록")
-            
-            cols = st.columns(3)
-            for i, sheet_name in enumerate(sheet_list):
-                with cols[i % 3]:
-                    st.markdown(f"- {sheet_name}")
     
     # 하단 통계
     st.markdown("---")
