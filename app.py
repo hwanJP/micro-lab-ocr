@@ -67,10 +67,10 @@ if "excel_saver" not in st.session_state:
         template_file=None
     )
     st.session_state.excel_path = excel_path
-
 # CSS 스타일
 st.markdown("""
 <style>
+    /* 헤더 스타일 */
     .compact-header {
         background: linear-gradient(90deg, #0066cc 0%, #0099ff 100%);
         padding: 0.5rem 1rem;
@@ -90,15 +90,29 @@ st.markdown("""
         opacity: 0.9;
     }
     
-    /* 좌우 컬럼에 직접 스타일 적용 */
-    [data-testid="column"] > div > div {
+    /* 🆕 컬럼 스타일 개선 - 여러 선택자 추가 */
+    [data-testid="column"] > div > div,
+    [data-testid="column"] .st-emotion-cache-1wmy9hl,
+    [data-testid="column"] > div[data-testid="stVerticalBlockBorderWrapper"] > div {
         border: 1px solid #e0e0e0;
         border-radius: 8px;
         padding: 1rem;
         background: white;
         min-height: 700px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
     }
     
+    /* 🆕 좌우 레이아웃 특정 스타일 */
+    .st-emotion-cache-2nmzdx > div > div,
+    .st-emotion-cache-12767kn > div > div {
+        border: 1px solid #e0e0e0 !important;
+        border-radius: 8px !important;
+        padding: 1rem !important;
+        background: white !important;
+        min-height: 700px !important;
+    }
+    
+    /* 상태 표시줄 */
     .status-bar {
         background: #f8f9fa;
         padding: 0.5rem 1rem;
@@ -107,6 +121,7 @@ st.markdown("""
         font-size: 0.9rem;
     }
     
+    /* 경고 박스 */
     .warning-box {
         background: #fff3cd;
         border-left: 4px solid #ffc107;
@@ -115,6 +130,7 @@ st.markdown("""
         border-radius: 4px;
     }
     
+    /* 정보 섹션 */
     .info-section {
         background: #f8f9fa;
         padding: 1rem;
@@ -122,6 +138,7 @@ st.markdown("""
         margin: 0.5rem 0;
     }
     
+    /* 단계 번호 */
     .step-number {
         display: inline-block;
         background: #0066cc;
@@ -133,6 +150,24 @@ st.markdown("""
         line-height: 24px;
         font-weight: bold;
         margin-right: 0.5rem;
+    }
+    
+    /* 🆕 전체 페이지 배경 */
+    .main .block-container {
+        padding-top: 2rem;
+        padding-bottom: 2rem;
+        background-color: #f5f7fa;
+    }
+    
+    /* 🆕 버튼 스타일 통일 */
+    .stButton > button {
+        border-radius: 4px;
+        transition: all 0.3s ease;
+    }
+    
+    .stButton > button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 8px rgba(0,0,0,0.15);
     }
 </style>
 """, unsafe_allow_html=True)
