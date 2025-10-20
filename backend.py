@@ -536,7 +536,7 @@ class ExcelIncrementalSaver:
     """
     
     # 🆕 기본 템플릿 파일 경로
-    DEFAULT_TEMPLATE = "미생물연구-OCR양식-v1.xlsx"
+    DEFAULT_TEMPLATE = "TestResult_OCR_v1.xlsx"
     
     def __init__(self, output_path="보존력시험_최종.xlsx", template_file=None):
         """
