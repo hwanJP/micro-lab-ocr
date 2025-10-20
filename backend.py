@@ -23,8 +23,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+from dotenv import load_dotenv
+load_dotenv()
 # 설정
-UPSTAGE_API_KEY = os.getenv("UPSTAGE_API_KEY", "up_AnFnsFxx4HBGjsGOkykMfiYzVDygL")
+UPSTAGE_API_KEY = os.getenv("UPSTAGE_API_KEY")
 UPSTAGE_URL = "https://api.upstage.ai/v1/document-ai/document-parse"
 STRAINS = ['E.coli', 'P.aeruginosa', 'S.aureus', 'C.albicans', 'A.brasiliensis']
 
