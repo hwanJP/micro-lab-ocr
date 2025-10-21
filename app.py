@@ -4,10 +4,22 @@ app.py 수정 버전
 
 import streamlit as st
 import pandas as pd
-import uuid
-from datetime import datetime
 import os
+import sys
 import tempfile
+import uuid
+import logging
+from pathlib import Path
+from datetime import datetime
+import io
+
+# 🆕 PyMuPDF import 추가
+import fitz  # PyMuPDF
+
+# 프로젝트 루트를 Python 경로에 추가
+current_dir = Path(__file__).parent
+if str(current_dir) not in sys.path:
+    sys.path.insert(0, str(current_dir))
 
 # 백엔드 모듈 import
 from backend import (
@@ -58,6 +70,10 @@ if "current_file_bytes" not in st.session_state:
 
 if "confirm_reset" not in st.session_state:
     st.session_state.confirm_reset = False
+    
+# 세션 초기화에 추가
+if 'processed_files' not in st.session_state:
+    st.session_state.processed_files = {}  # {file_name: processed_bytes}
 
 if "excel_saver" not in st.session_state:
     temp_dir = tempfile.gettempdir()
@@ -68,9 +84,10 @@ if "excel_saver" not in st.session_state:
     )
     st.session_state.excel_path = excel_path
 # CSS 스타일
+# CSS 스타일 - 최소화 버전
 st.markdown("""
 <style>
-    /* 헤더 스타일 */
+    /* 헤더만 유지 */
     .compact-header {
         background: linear-gradient(90deg, #0066cc 0%, #0099ff 100%);
         padding: 0.5rem 1rem;
@@ -90,28 +107,6 @@ st.markdown("""
         opacity: 0.9;
     }
     
-    /* 🆕 컬럼 스타일 개선 - 여러 선택자 추가 */
-    [data-testid="column"] > div > div,
-    [data-testid="column"] .st-emotion-cache-1wmy9hl,
-    [data-testid="column"] > div[data-testid="stVerticalBlockBorderWrapper"] > div {
-        border: 1px solid #e0e0e0;
-        border-radius: 8px;
-        padding: 1rem;
-        background: white;
-        min-height: 700px;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-    }
-    
-    /* 🆕 좌우 레이아웃 특정 스타일 */
-    .st-emotion-cache-2nmzdx > div > div,
-    .st-emotion-cache-12767kn > div > div {
-        border: 1px solid #e0e0e0 !important;
-        border-radius: 8px !important;
-        padding: 1rem !important;
-        background: white !important;
-        min-height: 700px !important;
-    }
-    
     /* 상태 표시줄 */
     .status-bar {
         background: #f8f9fa;
@@ -128,46 +123,6 @@ st.markdown("""
         padding: 0.75rem;
         margin: 0.5rem 0;
         border-radius: 4px;
-    }
-    
-    /* 정보 섹션 */
-    .info-section {
-        background: #f8f9fa;
-        padding: 1rem;
-        border-radius: 5px;
-        margin: 0.5rem 0;
-    }
-    
-    /* 단계 번호 */
-    .step-number {
-        display: inline-block;
-        background: #0066cc;
-        color: white;
-        width: 24px;
-        height: 24px;
-        border-radius: 50%;
-        text-align: center;
-        line-height: 24px;
-        font-weight: bold;
-        margin-right: 0.5rem;
-    }
-    
-    /* 🆕 전체 페이지 배경 */
-    .main .block-container {
-        padding-top: 2rem;
-        padding-bottom: 2rem;
-        background-color: #f5f7fa;
-    }
-    
-    /* 🆕 버튼 스타일 통일 */
-    .stButton > button {
-        border-radius: 4px;
-        transition: all 0.3s ease;
-    }
-    
-    .stButton > button:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 4px 8px rgba(0,0,0,0.15);
     }
 </style>
 """, unsafe_allow_html=True)
@@ -198,34 +153,63 @@ with header_col1:
         )
         
         if uploaded_file:
+            # 🆕 파일 식별자 생성 (이름 + 크기)
+            file_id = f"{uploaded_file.name}_{len(uploaded_file.getvalue())}"
+            
             # 🆕 파일이 변경되었는지 확인
             if st.session_state.current_file_name != uploaded_file.name:
-                # 🆕 DRM 처리 추가
-                with st.spinner("🔐 파일 확인 중..."):
-                    # 원본 파일 bytes
-                    original_bytes = uploaded_file.getvalue()
-                    
-                    # DRM 처리
-                    drm_success, processed_bytes, drm_message = PDFProcessor.process_drm_if_needed(original_bytes)
-                    
-                    if not drm_success:
-                        st.error(f"❌ 파일 처리 실패: {drm_message}")
-                        logger.error(f"DRM 처리 실패: {drm_message}")
-                        st.stop()
-                    
-                    # DRM 처리된 파일 저장
-                    st.session_state.current_file_name = uploaded_file.name
-                    st.session_state.current_file_bytes = processed_bytes  # ← DRM 해제된 bytes
-                    st.session_state.current_page = 1
-                    
-                    # 사용자에게 알림
-                    if "DRM 처리 완료" in drm_message or "DRM 해제" in drm_message:
-                        st.success(f"✅ {drm_message}")
-                        logger.info(f"📁 DRM 파일 업로드 및 해제 완료: {uploaded_file.name}")
-                    else:
-                        logger.info(f"📁 일반 파일 업로드: {uploaded_file.name}")
-                    
-                    st.rerun()
+                # 🆕 이미 처리된 파일인지 확인
+                if file_id not in st.session_state.processed_files:
+                    with st.spinner("🔐 파일 확인 중..."):
+                        # 원본 파일 bytes
+                        original_bytes = uploaded_file.getvalue()
+                        
+                        # DRM 처리 (최초 1회만)
+                        drm_success, processed_bytes, drm_message = PDFProcessor.process_drm_if_needed(original_bytes)
+                        
+                        if not drm_success:
+                            st.error(f"❌ 파일 처리 실패: {drm_message}")
+                            logger.error(f"DRM 처리 실패: {drm_message}")
+                            st.stop()
+                        
+                        # 🆕 페이지 수 확인
+                        try:
+                            doc = fitz.open(stream=processed_bytes, filetype="pdf")
+                            page_count = doc.page_count
+                            doc.close()
+                        except Exception as e:
+                            st.error(f"❌ PDF 열기 실패: {e}")
+                            logger.error(f"PDF 열기 실패: {e}")
+                            st.stop()
+                        
+                        # 🆕 처리된 파일 캐싱
+                        st.session_state.processed_files[file_id] = {
+                            'bytes': processed_bytes,
+                            'message': drm_message,
+                            'name': uploaded_file.name,
+                            'page_count': page_count
+                        }
+                        logger.info(f"✅ 파일 처리 완료 및 캐싱: {file_id} ({page_count} 페이지)")
+                        
+                        # 사용자에게 알림
+                        if "DRM 처리 완료" in drm_message or "DRM 해제" in drm_message:
+                            st.success(f"✅ {drm_message} | 총 {page_count} 페이지")
+                        else:
+                            st.success(f"✅ 파일 로드 완료 | 총 {page_count} 페이지")
+                else:
+                    logger.info(f"✅ 캐시된 파일 사용: {file_id}")
+                
+                # 🆕 캐시에서 처리된 파일 가져오기
+                processed_file_info = st.session_state.processed_files[file_id]
+                
+                # 세션에 저장
+                st.session_state.current_file_name = uploaded_file.name
+                st.session_state.current_file_bytes = processed_file_info['bytes']  # ← DRM 해제된 bytes
+                st.session_state.current_file_id = file_id  # 🆕 파일 ID 저장
+                st.session_state.current_page = 1
+                
+                logger.info(f"📁 파일 설정 완료: {uploaded_file.name}")
+                st.rerun()
 
 with header_col2:
     if has_work:
@@ -240,7 +224,10 @@ with header_col2:
                 st.session_state.fallback_manager.reset()
                 st.session_state.current_file_name = None
                 st.session_state.current_file_bytes = None
+                st.session_state.current_file_id = None  # 🆕 추가
                 st.session_state.confirm_reset = False
+                # 🆕 캐시는 유지 (같은 파일 다시 업로드 시 빠르게)
+                # st.session_state.processed_files = {}  # 필요시 주석 해제
                 
                 # Excel 초기화
                 temp_dir = tempfile.gettempdir()
@@ -306,7 +293,7 @@ if current_file:
             with st.spinner(f"페이지 {st.session_state.current_page} 처리 중..."):
                 # 🆕 DRM 처리 상태 표시
                 drm_placeholder = st.empty()
-                drm_placeholder.info("🔐 DRM 확인 중...")
+                # drm_placeholder.info("🔐 DRM 확인 중...")
                 
                 result = process_pdf_page(
                     current_file.getvalue(), 
@@ -455,150 +442,242 @@ if current_file:
             issues = validate_data(df_check)
             
             if issues:
-                warning_html = f"""
-                <div class="warning-box">
-                    <strong>주의:</strong> {', '.join(issues)}
-                </div>
-                """
-                st.markdown(warning_html, unsafe_allow_html=True)
+                pass
+                # warning_html = f"""
+                # <div class="warning-box">
+                #     <strong>주의:</strong> {', '.join(issues)}
+                # </div>
+                # """
+                # st.markdown(warning_html, unsafe_allow_html=True)
     
     # 좌우 레이아웃 (4:6 비율)
     left_col, right_col = st.columns([4, 6], gap="medium")
-    
+
     # 좌측: PDF 미리보기
     with left_col:
-        st.markdown("#### PDF 미리보기")
-        
-        img_bytes = PDFProcessor.render_page_image(
-            current_file.getvalue(), 
-            st.session_state.current_page - 1, 
-            zoom=2.5  # zoom 증가
-        )
-        
-        if img_bytes:
-            st.image(
-                img_bytes,
-                caption=f"{current_file.name} - 페이지 {st.session_state.current_page}/{page_count}"
+        # 🆕 네이티브 컨테이너 사용
+        with st.container(border=True):
+            st.markdown("#### PDF 미리보기")
+            
+            img_bytes = PDFProcessor.render_page_image(
+                current_file.getvalue(), 
+                st.session_state.current_page - 1, 
+                zoom=2.5
             )
-        else:
-            st.error("이미지 렌더링 실패")
-    
+            
+            if img_bytes:
+                st.image(
+                    img_bytes,
+                    caption=f"{current_file.name} - 페이지 {st.session_state.current_page}/{page_count}",
+                    use_container_width=True
+                )
+            else:
+                st.error("이미지 렌더링 실패")
+
     # 우측: OCR 결과
     with right_col:
-        st.markdown("#### OCR 결과 데이터")
-        
-        key = (current_file.name, st.session_state.current_page)
-        
-        if key in st.session_state.ocr_data_frames:
-            bundle = st.session_state.ocr_data_frames[key]
-            
-            if isinstance(bundle, pd.DataFrame):
-                df_table = bundle
-                df_date = pd.DataFrame(columns=['date_0', 'date_7', 'date_14', 'date_28'])
-            else:
-                df_table = bundle.get("table", pd.DataFrame())
-                df_date = bundle.get("date", pd.DataFrame())
-            
-            # 🆕 날짜 정보 항상 표시
-            if not df_date.empty and any(df_date.iloc[0].notna()):
-                st.markdown("**날짜 정보**")
-                date_display = df_date.copy()
-                date_display.columns = ['0일', '7일', '14일', '28일']
-                st.dataframe(date_display, use_container_width=True, height=80)
-            elif st.session_state.last_date_info:
-                # 현재 페이지에 날짜 없으면 이전 값 표시
-                st.markdown("**날짜 정보** (이전 페이지)")
-                date_display = pd.DataFrame([{
-                    '0일': st.session_state.last_date_info.get('date_0', ''),
-                    '7일': st.session_state.last_date_info.get('date_7', ''),
-                    '14일': st.session_state.last_date_info.get('date_14', ''),
-                    '28일': st.session_state.last_date_info.get('date_28', '')
-                }])
-                st.dataframe(date_display, use_container_width=True, height=80)
-                st.caption("이전 페이지의 날짜 정보를 사용합니다")
-            else:
-                st.warning("날짜 정보 없음")
-            
-            # 데이터 테이블
-            if not df_table.empty:
+            # 🆕 네이티브 컨테이너 사용
+            with st.container(border=True, height=1100):
+                st.markdown("#### OCR 결과 데이터")
                 
-                # 🆕 표시용 DataFrame 생성 (중복 제거)
-                df_display = df_table.copy()
+                key = (current_file.name, st.session_state.current_page)
                 
-                # 시험번호 중복 제거
-                prev_test = None
-                for i in range(len(df_display)):
-                    curr = df_display.iloc[i]['test_number']
-                    if curr == prev_test:
-                        df_display.at[df_display.index[i], 'test_number'] = ''
+                if key in st.session_state.ocr_data_frames:
+                    bundle = st.session_state.ocr_data_frames[key]
+                    
+                    if isinstance(bundle, pd.DataFrame):
+                        df_table = bundle
+                        df_date = pd.DataFrame(columns=['date_0', 'date_7', 'date_14', 'date_28'])
                     else:
-                        prev_test = curr
-                
-                # 처방번호 중복 제거
-                if 'prescription_number' in df_display.columns:
-                    prev_presc = None
-                    for i in range(len(df_display)):
-                        curr = df_display.iloc[i]['prescription_number']
-                        if curr == prev_presc:
-                            df_display.at[df_display.index[i], 'prescription_number'] = ''
-                        else:
-                            prev_presc = curr
-                
-                col_config = {
-                    'test_number': st.column_config.TextColumn("시험번호", width="small"),
-                    'prescription_number': st.column_config.TextColumn("처방번호", width="small"),
-                    'strain': st.column_config.SelectboxColumn("균주", options=STRAINS, width="small"),
-                    'cfu_0day': st.column_config.TextColumn("0일 CFU", width="small"),
-                    'cfu_7day': st.column_config.TextColumn("7일 CFU", width="small"),
-                    'cfu_14day': st.column_config.TextColumn("14일 CFU", width="small"),
-                    'cfu_28day': st.column_config.TextColumn("28일 CFU", width="small"),
-                    'judgment': st.column_config.SelectboxColumn("판정", options=['적합', '부적합'], width="small"),
-                    'final_judgment': st.column_config.SelectboxColumn("최종판정", options=['적합', '부적합'], width="small")
-                }
-                
-                edited_df = st.data_editor(
-                    df_display,
-                    column_config=col_config,
-                    num_rows="dynamic",
-                    hide_index=True,
-                    key=f"editor_{current_file.name}_{st.session_state.current_page}",
-                    use_container_width=True,
-                    height=700
-                )
-                
-                # 편집된 데이터 저장
-                # 🆕 편집 데이터 복원 (빈 값 채우기)
-                edited_restored = edited_df.copy()
-                
-                prev_test = None
-                for i in range(len(edited_restored)):
-                    curr = edited_restored.iloc[i]['test_number']
-                    if curr == '' or pd.isna(curr):
-                        edited_restored.at[edited_restored.index[i], 'test_number'] = prev_test
+                        df_table = bundle.get("table", pd.DataFrame())
+                        df_date = bundle.get("date", pd.DataFrame())
+                    
+                    # 🆕 날짜 정보 항상 표시
+                    if not df_date.empty and any(df_date.iloc[0].notna()):
+                        st.markdown("**날짜 정보**")
+                        date_display = df_date.copy()
+                        date_display.columns = ['0일', '7일', '14일', '28일']
+                        st.dataframe(date_display, use_container_width=True, height=80)
+                    elif st.session_state.last_date_info:
+                        st.markdown("**날짜 정보** (이전 페이지)")
+                        date_display = pd.DataFrame([{
+                            '0일': st.session_state.last_date_info.get('date_0', ''),
+                            '7일': st.session_state.last_date_info.get('date_7', ''),
+                            '14일': st.session_state.last_date_info.get('date_14', ''),
+                            '28일': st.session_state.last_date_info.get('date_28', '')
+                        }])
+                        st.dataframe(date_display, use_container_width=True, height=80)
+                        st.caption("이전 페이지의 날짜 정보를 사용합니다")
                     else:
-                        prev_test = curr
-                
-                if 'prescription_number' in edited_restored.columns:
-                    prev_presc = None
-                    for i in range(len(edited_restored)):
-                        curr = edited_restored.iloc[i]['prescription_number']
-                        if curr == '' or pd.isna(curr):
-                            edited_restored.at[edited_restored.index[i], 'prescription_number'] = prev_presc
-                        else:
-                            prev_presc = curr
-                
-                # 편집된 데이터 저장
-                st.session_state.ocr_data_frames[key] = {"table": edited_restored, "date": df_date}  # 🆕 변경
-                
+                        st.warning("날짜 정보 없음")
+                    
+                    # 데이터 테이블
+                    if not df_table.empty:
+                        # 🆕 표시용 DataFrame 생성
+                        df_display = df_table.copy()
+                        
+                        # ========================================
+                        # 검증 함수 1: 일반 누락 표시 (기존)
+                        # ========================================
+                        def mark_missing(value):
+                            """누락 표시"""
+                            value_str = str(value).strip()
+                            if not value_str or value_str == '' or pd.isna(value):
+                                return "❌"
+                            return value
+                        
+                        
+                        # ========================================
+                        # 검증 함수 2: A.brasiliensis 확인 요청 (신규)
+                        # ========================================
+                        def mark_brasiliensis(value, strain):
+                            """
+                            A.brasiliensis 확인 요청 표시
                             
+                            Args:
+                                value: CFU 값
+                                strain: 균주명
+                                
+                            Returns:
+                                str: 
+                                    - 누락: '❌'
+                                    - A.brasiliensis: '⚠️ {값}'
+                                    - 기타: '{값}'
+                            """
+                            value_str = str(value).strip()
+                            
+                            # 누락
+                            if not value_str or value_str == '' or pd.isna(value):
+                                return "❌"
+                            
+                            # A.brasiliensis면 ⚠️ 추가
+                            if 'brasiliensis' in strain.lower():
+                                return f"⚠️ {value_str}"
+                            
+                            return value_str
+                        
+                        
+                        # ========================================
+                        # 이모지 제거 함수 (저장용)
+                        # ========================================
+                        def remove_emoji(value):
+                            """검증 이모지 제거 (저장용)"""
+                            value_str = str(value).strip()
+                            
+                            if value_str == '❌':
+                                return ''
+                            
+                            if '⚠️' in value_str:
+                                return value_str.replace('⚠️', '').strip()
+                            
+                            return value_str
+                        
+                        
+                        # ========================================
+                        # 🆕 CFU 컬럼 검증 적용 (A.brasiliensis 체크)
+                        # ========================================
+                        for idx, row in df_display.iterrows():
+                            strain = row.get('strain', '')
+                            
+                            for col in ['cfu_0day', 'cfu_7day', 'cfu_14day', 'cfu_28day']:
+                                if col in df_display.columns:
+                                    df_display.at[idx, col] = mark_brasiliensis(row[col], strain)
+                        
+                        
+                        # ========================================
+                        # 중복 제거 + 시험번호/처방번호 누락 표시 (기존)
+                        # ========================================
+                        prev_test = None
+                        prev_presc = None
+                        
+                        for i in range(len(df_display)):
+                            curr_test = df_display.iloc[i]['test_number']
+                            curr_presc = df_display.iloc[i].get('prescription_number', '')
+                            
+                            # 시험번호
+                            if curr_test == prev_test:
+                                df_display.at[df_display.index[i], 'test_number'] = ''
+                            else:
+                                test_str = str(curr_test).strip()
+                                if not test_str or test_str == '' or pd.isna(curr_test):
+                                    df_display.at[df_display.index[i], 'test_number'] = '❌'
+                                prev_test = curr_test
+                            
+                            # 처방번호
+                            if 'prescription_number' in df_display.columns:
+                                if curr_presc == prev_presc:
+                                    df_display.at[df_display.index[i], 'prescription_number'] = ''
+                                else:
+                                    presc_str = str(curr_presc).strip()
+                                    if not presc_str or presc_str == '' or pd.isna(curr_presc):
+                                        df_display.at[df_display.index[i], 'prescription_number'] = '❌'
+                                    prev_presc = curr_presc
+                        
+                        
+                        # ========================================
+                        # 데이터 에디터
+                        # ========================================
+                        col_config = {
+                            'test_number': st.column_config.TextColumn("시험번호", width="small"),
+                            'prescription_number': st.column_config.TextColumn("처방번호", width="small"),
+                            'strain': st.column_config.SelectboxColumn("균주", options=STRAINS, width="small"),
+                            'cfu_0day': st.column_config.TextColumn("0일 CFU", width="small", help="❌=누락, ⚠️=확인필요"),
+                            'cfu_7day': st.column_config.TextColumn("7일 CFU", width="small", help="❌=누락, ⚠️=확인필요"),
+                            'cfu_14day': st.column_config.TextColumn("14일 CFU", width="small", help="❌=누락, ⚠️=확인필요"),
+                            'cfu_28day': st.column_config.TextColumn("28일 CFU", width="small", help="❌=누락, ⚠️=확인필요"),
+                            'judgment': st.column_config.SelectboxColumn("판정", options=['적합', '부적합'], width="small"),
+                            'final_judgment': st.column_config.SelectboxColumn("최종판정", options=['적합', '부적합'], width="small")
+                        }
+                        
+                        edited_df = st.data_editor(
+                            df_display,
+                            column_config=col_config,
+                            num_rows="dynamic",
+                            hide_index=True,
+                            key=f"editor_{current_file.name}_{st.session_state.current_page}",
+                            use_container_width=True,
+                            height=800
+                        )
+                        
+                        
+                        # ========================================
+                        # 편집 데이터 정제 (❌, ⚠️ 제거)
+                        # ========================================
+                        edited_restored = edited_df.copy()
+                        
+                        # 모든 컬럼에서 이모지 제거
+                        for col in ['test_number', 'prescription_number', 'cfu_0day', 'cfu_7day', 'cfu_14day', 'cfu_28day']:
+                            if col in edited_restored.columns:
+                                edited_restored[col] = edited_restored[col].apply(remove_emoji)
+                        
+                        # 빈 값 복원
+                        prev_test = None
+                        for i in range(len(edited_restored)):
+                            curr = edited_restored.iloc[i]['test_number']
+                            if curr == '' or pd.isna(curr):
+                                edited_restored.at[edited_restored.index[i], 'test_number'] = prev_test
+                            else:
+                                prev_test = curr
+                        
+                        if 'prescription_number' in edited_restored.columns:
+                            prev_presc = None
+                            for i in range(len(edited_restored)):
+                                curr = edited_restored.iloc[i]['prescription_number']
+                                if curr == '' or pd.isna(curr):
+                                    edited_restored.at[edited_restored.index[i], 'prescription_number'] = prev_presc
+                                else:
+                                    prev_presc = curr
+                        
+                        # 편집된 데이터 저장
+                        st.session_state.ocr_data_frames[key] = {"table": edited_restored, "date": df_date}
+                        
+                    else:
+                        st.info("OCR 결과 데이터가 없습니다. OCR 시작 버튼을 클릭하세요.")
                 
-            else:
-                st.info("OCR 결과 데이터가 없습니다. OCR 시작 버튼을 클릭하세요.")
+                else:
+                    st.info("OCR 결과 데이터가 없습니다. OCR 시작 버튼을 클릭하세요.")
         
-        else:
-            st.info("OCR 결과 데이터가 없습니다. OCR 시작 버튼을 클릭하세요.")
-    
-    
+        
     # 하단 통계
     st.markdown("---")
     st.markdown("### 전체 현황")
