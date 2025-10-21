@@ -469,7 +469,7 @@ if current_file:
                 st.image(
                     img_bytes,
                     caption=f"{current_file.name} - 페이지 {st.session_state.current_page}/{page_count}",
-                    use_container_width=True
+                    use_column_width=True
                 )
             else:
                 st.error("이미지 렌더링 실패")
