@@ -16,10 +16,9 @@ logger = logging.getLogger(__name__)
 # ========================================
 # DRM 판별 함수
 # ========================================
-
 def detect_drm(file_input: Union[str, io.BytesIO]) -> Dict[str, any]:
     """
-    DRM 판별 - 확실한 방법만 사용
+    DRM 판별 - 확실한 방법만 사용 (개선)
     """
     result = {
         "is_drm": False,
@@ -42,7 +41,6 @@ def detect_drm(file_input: Union[str, io.BytesIO]) -> Dict[str, any]:
         
         reader = PyPDF2.PdfReader(f)
         
-        # ✅ is_encrypted == True → 확실한 DRM
         if reader.is_encrypted:
             result["is_drm"] = True
             result["method"] = "PyPDF2 암호화"
@@ -72,19 +70,18 @@ def detect_drm(file_input: Union[str, io.BytesIO]) -> Dict[str, any]:
             content = file_input.read()
             file_input.seek(0)
         
-        # PDF 확인
+        # PDF 헤더 확인 (없어도 계속 진행)
         if not content.startswith(b'%PDF'):
-            logger.warning("PDF 파일이 아님")
-            return result
-        
-        # ✅ /Encrypt → 확실한 DRM
-        if b'/Encrypt' in content:
-            result["is_drm"] = True
-            result["method"] = "바이너리 /Encrypt"
-            result["confidence"] = "high"
-            
-            logger.info("🔒 DRM 확정: /Encrypt 플래그")
-            return result
+            logger.warning("⚠️ PDF 헤더 없음 - DRM 가능성 높음")
+        else:
+            # /Encrypt 플래그 확인
+            if b'/Encrypt' in content:
+                result["is_drm"] = True
+                result["method"] = "바이너리 /Encrypt"
+                result["confidence"] = "high"
+                
+                logger.info("🔒 DRM 확정: /Encrypt 플래그")
+                return result
     
     except Exception as e:
         logger.debug(f"바이너리 확인 실패: {e}")
@@ -103,7 +100,7 @@ def detect_drm(file_input: Union[str, io.BytesIO]) -> Dict[str, any]:
             file_input.seek(0)
             doc = fitz.open(stream=file_bytes, filetype="pdf")
         
-        # ✅ 파일이 열리면 DRM 아님
+        # 파일이 열리면 DRM 아님
         page_count = doc.page_count
         doc.close()
         
@@ -116,27 +113,25 @@ def detect_drm(file_input: Union[str, io.BytesIO]) -> Dict[str, any]:
         return result
     
     except Exception as e:
-        # 파일 열기 실패 → DRM 가능성 높음
-        if "password" in str(e).lower() or "encrypted" in str(e).lower():
-            result["is_drm"] = True
+        # 파일 열기 실패 → DRM으로 처리
+        error_str = str(e).lower()
+        
+        logger.warning(f"🔒 파일 열기 실패 - DRM으로 처리: {e}")
+        
+        result["is_drm"] = True
+        result["details"]["error"] = str(e)
+        
+        if "password" in error_str or "encrypted" in error_str:
             result["method"] = "파일 열기 실패 (암호화)"
             result["confidence"] = "high"
-            
-            logger.info(f"🔒 DRM 가능성: {e}")
-            return result
+        elif "broken" in error_str:
+            result["method"] = "파일 열기 실패 (DRM 가능)"
+            result["confidence"] = "high"
         else:
-            logger.debug(f"파일 손상 가능성: {e}")
-    
-    # ========================================
-    # 최종: 확실한 증거 없음 → DRM 아님
-    # ========================================
-    result["is_drm"] = False
-    result["method"] = "DRM 증거 없음"
-    result["confidence"] = "medium"
-    
-    logger.info("✅ DRM 없음 (추정)")
-    return result
-
+            result["method"] = "파일 손상 (DRM 가능)"
+            result["confidence"] = "medium"
+        
+        return result
 
 # ========================================
 # DRM 해제 함수
