@@ -63,4 +63,4 @@ jobs:
         with:
           app-name: 'KOLMAR-APP-Fingerpoint-microbio-ocr'
           slot-name: 'Production'
-          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_0F1898293FAF4941997A2EB896F1938D }}
+          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_C0E988F5B13740DCA76F16539F37F39F }}
